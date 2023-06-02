@@ -11,7 +11,6 @@ path = 'data/'
 
 # Load data
 
-
 from sklearn.utils import resample
 from scipy.stats import pointbiserialr, chi2_contingency
 from scipy.cluster.hierarchy import linkage, fcluster
@@ -21,7 +20,6 @@ class DataPreprocessing:
     def __init__(self, df, target):
         self.df = df
         self.target = target
-        self.IMB_THRESHOLD = 0.95
         self.scaler = StandardScaler()  # Create a StandardScaler instance
 
     def label_encoding(self):
@@ -36,41 +34,61 @@ class DataPreprocessing:
         return self.df
 
     def remove_zero_variance(self):
-        self.df = self.df.loc[:, self.df.var() != 0.0]
+        # Select numeric columns
+        numeric_cols = self.df.select_dtypes(include=[np.number]).columns
+        # Select non-numeric columns
+        non_numeric_cols = self.df.select_dtypes(exclude=[np.number]).columns
+
+        # Calculate variance for numeric columns and identify zero variance columns
+        numeric_zero_var_cols = [col for col in numeric_cols if self.df[col].var() == 0.0]
+        # Identify zero variance non-numeric columns
+        non_numeric_zero_var_cols = [col for col in non_numeric_cols if self.df[col].nunique() <= 1]
+
+        # Concatenate lists
+        zero_var_cols = numeric_zero_var_cols + non_numeric_zero_var_cols
+
+        # Drop zero variance columns
+        self.df = self.df.drop(columns=zero_var_cols)
+
         return self.df
 
-    def upper_case_columns(self):
+    def clean(self):
         self.df.columns = map(str.upper, self.df.columns)
+        self.df = self.df.loc[:, ~self.df.columns.str.endswith(('_ID', '_NBR'))].copy()
+        self.df.fillna(0, inplace=True)
         return self.df
 
-    def fill_target_nulls(self):
-        self.df[self.target].fillna(0, inplace=True)
-        return self.df
-
-    def remove_ids(self):
-        # Remove columns ending with '_ID' or '_NBR'
-        self.df = self.df[self.df.columns[~self.df.columns.str.endswith(('_ID', '_NBR'))]]
-        return self.df
 
     def normalize(self):
-        self.df = pd.DataFrame(self.scaler.fit_transform(self.df), columns = self.df.columns)
+        self.scalers = {}  # Initialize the dictionary of scalers
+        for col in self.df.columns:
+            if (
+                (self.df[col].dtype == 'float64' or self.df[col].dtype == 'int64') and 
+                len(self.df[col].unique()) >= 10 and 
+                not any(substr in col for substr in ["CNT", "IND", "CHG", "PCT", "3M", "6M"])
+            ):
+                scaler = StandardScaler()
+                self.df[col] = scaler.fit_transform(self.df[[col]])
+                self.scalers[col] = scaler  # Store the scaler used for this column
         return self.df
 
     def denormalize(self, df_normalized):
-        df_denormalized = pd.DataFrame(self.scaler.inverse_transform(df_normalized), columns=df_normalized.columns)
-        return df_denormalized
+        for col in df_normalized.columns:
+            if col in self.scalers:  # Only denormalize columns that were originally normalized
+                df_normalized[col] = self.scalers[col].inverse_transform(df_normalized[[col]])
+        return df_normalized
 
-    def balance_classes(self):
+    def balance_classes(self, threshold):
         # check if class imbalance exists
         counts = self.df[self.target].value_counts()
-        if max(counts) / sum(counts) > self.IMB_THRESHOLD:
+        if max(counts) / sum(counts) > threshold:
             majority_class = counts.idxmax()
             minority_class = counts.idxmin()
             df_majority = self.df[self.df[self.target] == majority_class]
             df_minority = self.df[self.df[self.target] == minority_class]
             
             # Downsample majority class until minority class is 5% of dataset
-            downsample_ratio = int(len(df_minority) / (1-self.IMB_THRESHOLD))
+            downsample_ratio = int(len(df_minority) / (1-threshold))
             df_majority_downsampled = resample(df_majority, replace=False, n_samples=downsample_ratio, random_state=42)
             
             self.df = pd.concat([df_majority_downsampled, df_minority])
@@ -141,26 +159,107 @@ class DataPreprocessing:
         return self.df
 
 
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_selection import RFE
+from sklearn.linear_model import LogisticRegression
+import xgboost as xgb
+from sklearn.inspection import permutation_importance
+import numpy as np
+import pandas as pd
+from scipy.stats import spearmanr
+from collections import defaultdict
+
+class FeatureSelector:
+    def __init__(self, X, y):
+        self.X = X
+        self.y = y
+
+    def rfe_rf(self):
+        selector = RFE(estimator=RandomForestClassifier(), n_features_to_select=200, step=1)
+        selector = selector.fit(self.X, self.y)
+        return self.X.columns[selector.support_]
+
+    def rfe_lr(self):
+        selector = RFE(estimator=LogisticRegression(max_iter=1000), n_features_to_select=200, step=1)
+        selector = selector.fit(self.X, self.y)
+        return self.X.columns[selector.support_]
+
+    def xgboost(self):
+        model = xgb.XGBClassifier(use_label_encoder=False)
+        model.fit(self.X, self.y)
+        importance = model.feature_importances_
+        idx = np.argsort(importance)[-200:]
+        return self.X.columns[idx]
+
+    def permutation_importance(self):
+        rf = RandomForestClassifier().fit(self.X, self.y)
+        result = permutation_importance(rf, self.X, self.y, n_repeats=10, random_state=0)
+        sorted_idx = result.importances_mean.argsort()[-200:]
+        return self.X.columns[sorted_idx]
+
+    def process(self):
+
+        rfe_rf = RFE(estimator=RandomForestClassifier(), n_features_to_select=200, step=1)
+        rfe_rf.fit(self.X, self.y)
+        rfe_rf_cols = self.X.columns[rfe_rf.support_]
+        rfe_rf_importances = rfe_rf.estimator_.feature_importances_
+
+        rfe_lr = RFE(estimator=LogisticRegression(max_iter=5000), n_features_to_select=200, step=1)
+        rfe_lr.fit(self.X, self.y)
+        rfe_lr_cols = self.X.columns[rfe_lr.support_]
+        rfe_lr_importances = np.abs(rfe_lr.estimator_.coef_)[0]
+
+        model = xgb.XGBClassifier()
+        model.fit(self.X, self.y)
+        xgb_cols = self.X.columns
+        xgb_importances = model.feature_importances_
+
+        rf = RandomForestClassifier().fit(self.X, self.y)
+        permutation_result = permutation_importance(rf, self.X, self.y, n_repeats=10, random_state=0)
+        permutation_cols = self.X.columns
+        permutation_importances = permutation_result.importances_mean
+
+        methods = [(rfe_rf_cols.to_list(), rfe_rf_importances), 
+                (rfe_lr_cols.to_list(), rfe_lr_importances), 
+                (xgb_cols.to_list(), xgb_importances), 
+                (permutation_cols.to_list(), permutation_importances)]
+
+        top_features = []
+        for cols, importances in methods:
+            # Sort features by importance
+            sorted_idx = np.argsort(importances)[::-1]
+            sorted_cols = [cols[i] for i in sorted_idx]
+            to_drop = []
+            for i, col in enumerate(sorted_cols):
+                # Compare only with more important features
+                cor_matrix = self.X[sorted_cols[:i+1]].corr().abs()
+                # If current feature is highly correlated with any preceding feature
+                if any(cor_matrix[col][:-1] > 0.7):
+                    to_drop.append(col)
+            sorted_cols = [col for col in sorted_cols if col not in to_drop]
+
+            # get top 50 from each method
+            top_features.append(sorted_cols[:50])
+
+        # get common features
+        common_features = list(set.intersection(*[set(method) for method in top_features]))
+
+        # if common features < 50, get from rfe_rf_cols and xgb_cols
+        if len(common_features) < 50:
+            alternates = list(zip(rfe_rf_cols, xgb_cols))
+            for alternate in alternates:
+                for feature in alternate:
+                    if feature not in common_features:
+                        cor_matrix = self.X[common_features + [feature]].corr().abs()
+                        if all(cor_matrix[feature][:-1] < 0.7):
+                            common_features.append(feature)
+                            if len(common_features) == 50:
+                                break
+                if len(common_features) == 50:
+                    break
+        return common_features
 
 
-
-    # Implement other preprocessing steps...
-
-
-class Model:
-    def __init__(self, df, target):
-        self.df = df
-        self.target = target
-        self.X = df.drop(target, axis=1)
-        self.y = df[target]
-
-    def fit_model(self):
-        pass
-
-    def feature_selection(self):
-        pass
-
-# Usage:
 
 df = pd.read_csv(path + 'data.csv')
 
@@ -169,19 +268,15 @@ target = 'TARGET'
 preprocessor = DataPreprocessing(df, target)
 
 # Apply preprocessing steps
-df = preprocessor.label_encoding()
+df = preprocessor.clean()
 df = preprocessor.remove_high_nullity(threshold=0.8)
 df = preprocessor.remove_zero_variance()
-df = preprocessor.balance_classes()
+df = preprocessor.balance_classes(threshold=0.95)
 df = preprocessor.limit_data_size()
+df = preprocessor.label_encoding()
 df = preprocessor.feature_correlation()
+df = preprocessor.variable_clustering()
 df = preprocessor.normalize()
 
-# Initialize your model class
-model = Model(df, target)
-
-# Fit models and perform feature selection
-model.fit_model()
-model.feature_selection()
-
-# You can add more classes or methods as needed for your specific task
+model = FeatureSelector(df.drop(columns=[target]), df[target])
+final_vars = model.process()
