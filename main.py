@@ -1,30 +1,31 @@
+print('Executing code...')
+
 # Import libraries
 import os
-import pandas as pd
 import numpy as np
+import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
-
-from sklearn.utils import resample
-from scipy.stats import pointbiserialr, chi2_contingency
-from scipy.cluster.hierarchy import linkage, fcluster
-from scipy.spatial.distance import pdist, squareform
-
-import matplotlib.backends.backend_pdf
-
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_selection import RFE
 from sklearn.linear_model import LogisticRegression
-import xgboost as xgb
+from sklearn.utils import resample
 from sklearn.inspection import permutation_importance
-import numpy as np
-import pandas as pd
-from scipy.stats import spearmanr
+
+from scipy.stats import pointbiserialr, chi2_contingency, spearmanr
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import pdist, squareform
+
+import xgboost as xgb
+
 from collections import defaultdict
+import itertools
+
+import matplotlib.backends.backend_pdf
 
 class DataPreprocessing:
     def __init__(self, df, target):
@@ -41,6 +42,7 @@ class DataPreprocessing:
 
     def remove_high_nullity(self, threshold):
         self.df = self.df[self.df.columns[self.df.isnull().mean() < threshold]]
+        print(f'Removing vars with high nullity - {len(self.df.columns)} variables remaining.')
         return self.df
 
     def remove_zero_variance(self):
@@ -59,6 +61,8 @@ class DataPreprocessing:
 
         # Drop zero variance columns
         self.df = self.df.drop(columns=zero_var_cols)
+
+        print(f'Removing vars with zero variance - {len(self.df.columns)} variables remaining.')
 
         return self.df
 
@@ -138,6 +142,8 @@ class DataPreprocessing:
             selected_cols.append(self.target)
 
         self.df = self.df.loc[:, selected_cols]
+
+        print(f'Creating correlation matrix - {len(self.df.columns)} variables selected.')
         return self.df
 
     def variable_clustering(self):
@@ -167,7 +173,11 @@ class DataPreprocessing:
         # Update the DataFrame to include only the selected features, along with the target variable
         self.df = self.df[selected_features + [self.target]]
 
+        print(f'Performing variable clustering - {len(self.df.columns)} variables selected.')
         return self.df
+    
+    def remaining_cols(self):
+        return f'{len(self.df.columns)} variables selected.'
 
 class FeatureSelector:
     def __init__(self, X, y):
@@ -199,29 +209,51 @@ class FeatureSelector:
 
     def process(self):
 
+        final_vars = []
+
+        def get_top_features(cols, importances):
+            # Sort features by importance
+            sorted_idx = np.argsort(importances)[::-1]
+            sorted_cols = [cols[i] for i in sorted_idx]
+            to_drop = []
+            for i, col in enumerate(sorted_cols):
+                # Compare only with more important features
+                cor_matrix = self.X[sorted_cols[:i+1]].corr().abs()
+                # If current feature is highly correlated with any preceding feature
+                if any(cor_matrix[col][:-1] > 0.7):
+                    to_drop.append(col)
+            sorted_cols = [col for col in sorted_cols if col not in to_drop]
+            return sorted_cols[:3]  # Return top 3 features
+
         print('Selecting features using RFE with Random Forest...')
         rfe_rf = RFE(estimator=RandomForestClassifier(n_jobs=-1, random_state=42, n_estimators=100), n_features_to_select=200, step=1)
         rfe_rf.fit(self.X, self.y)
         rfe_rf_cols = self.X.columns[rfe_rf.support_]
         rfe_rf_importances = rfe_rf.estimator_.feature_importances_
+        final_vars.extend(get_top_features(rfe_rf_cols.to_list(), rfe_rf_importances))
 
         print('Selecting features using RFE with Logistic Regression...')
         rfe_lr = RFE(estimator=LogisticRegression(max_iter=5000, n_jobs=-1), n_features_to_select=200, step=1)
         rfe_lr.fit(self.X, self.y)
         rfe_lr_cols = self.X.columns[rfe_lr.support_]
         rfe_lr_importances = np.abs(rfe_lr.estimator_.coef_)[0]
+        final_vars.extend(get_top_features(rfe_lr_cols.to_list(), rfe_lr_importances))
 
         print('Selecting features using XGBoost...')
         model = xgb.XGBClassifier(n_jobs=-1)
         model.fit(self.X, self.y)
         xgb_cols = self.X.columns
         xgb_importances = model.feature_importances_
+        final_vars.extend(get_top_features(xgb_cols.to_list(), xgb_importances))
 
         print('Selecting features using permutation importance...')
         rf = RandomForestClassifier(n_jobs=-1, random_state=42, n_estimators=25).fit(self.X, self.y)
         permutation_result = permutation_importance(rf, self.X, self.y, n_repeats=10, random_state=0)
         permutation_cols = self.X.columns
         permutation_importances = permutation_result.importances_mean
+        final_vars.extend(get_top_features(permutation_cols.to_list(), permutation_importances))
+
+        final_vars = list(set(final_vars))  # Remove duplicates
 
         methods = [(rfe_rf_cols.to_list(), rfe_rf_importances), 
                 (rfe_lr_cols.to_list(), rfe_lr_importances), 
@@ -246,23 +278,28 @@ class FeatureSelector:
             top_features.append(sorted_cols[:50])
 
         print('Getting common features from all methods...')
-        # get common features
+
+        # get common features, add to final_vars
         common_features = list(set.intersection(*[set(method) for method in top_features]))
+        final_vars.extend(common_features)
+        final_vars = list(set(final_vars))  # Remove duplicates
 
         # if common features < 50, get from rfe_rf_cols and xgb_cols
-        if len(common_features) < 50:
+        if len(final_vars) < 50:
             alternates = list(zip(rfe_rf_cols, xgb_cols))
-            for alternate in alternates:
-                for feature in alternate:
-                    if feature not in common_features:
-                        cor_matrix = self.X[common_features + [feature]].corr().abs()
-                        if all(cor_matrix[feature][:-1] < 0.7):
-                            common_features.append(feature)
-                            if len(common_features) == 50:
-                                break
-                if len(common_features) == 50:
-                    break
-        return common_features
+            alternates = list(itertools.chain(*alternates))  # Flatten the list
+            for feature in alternates:
+                if feature not in final_vars:
+                    cor_matrix = self.X[final_vars + [feature]].corr().abs()
+                    if all(cor_matrix[feature][:-1] < 0.7):
+                        final_vars.append(feature)
+                        if len(final_vars) == 50:
+                            break
+        
+        final_vars = list(set(final_vars))  # Remove duplicates after adding features
+        return(final_vars)
+
+
 
 
 class Model:
@@ -300,7 +337,7 @@ class Model:
         else:
             raise Exception(f"No feature importances available for model type: {self.model_type}")
 
-    def plot_importance(self, top_n=10, pdf_pages=None):
+    def plot_importance(self, top_n=30, pdf_pages=None):
         importances = self.feature_importance(top_n)
         
         fig = plt.figure(figsize=(10, 6))
@@ -342,15 +379,15 @@ class Model:
             plt.title(f'Average TARGET per {feature}')
             plt.xlabel(feature)
             plt.ylabel('Average TARGET')
-            plt.xticks(rotation=90)  # Rotate x-axis labels
+            plt.xticks(rotation=45)  # Rotate x-axis labels
             plt.tight_layout()
             
             # If pdf_pages is not None, save the figure to the pdf
             if pdf_pages is not None:
                 pdf_pages.savefig(fig)
+                plt.close(fig)  # Close the figure after saving
             else:
                 plt.show()
-
             
     def export_to_pdf(self, filename, n_bins=10):
         with matplotlib.backends.backend_pdf.PdfPages(filename) as pdf:
@@ -360,43 +397,70 @@ class Model:
             self.plot_features(n_bins=n_bins, pdf_pages=pdf)
 
 
+def read_and_union_csvs(directory="."):
+    # Get all files in directory
+    all_files = os.listdir(directory)
+    # Filter for csv files
+    csv_files = [file for file in all_files if file.endswith('.csv')]
+    
+    # Initialize an empty dataframe to store all data
+    combined_df = pd.DataFrame()
+    
+    # Iterate over all csv files
+    for file in csv_files:
+        # Read the csv file
+        df = pd.read_csv(file)
+        # Append the data to the combined dataframe
+        combined_df = pd.concat([combined_df, df], ignore_index=True)
+        
+    return combined_df
+
+if __name__ == '__main__':
+
+    # Read and union all csv files in the current directory
+    df = read_and_union_csvs()
+
+    while True:
+        print('Enter the name of the target column (case sensitive), or "escape" to stop:')
+        target = input()
+
+        if target.lower() == 'escape':
+            print('User stopped the process.')
+            break
+        elif target in df.columns:
+            preprocessor = DataPreprocessing(df, target)
+            break
+        else:
+            print(f'{target} is not a column in the DataFrame. Please try again.')
+
+    # Apply preprocessing steps
+    df = preprocessor.clean()
+    df = preprocessor.remove_high_nullity(threshold=0.8)
+    df = preprocessor.remove_zero_variance()
+    df = preprocessor.balance_classes(threshold=0.95)
+    df = preprocessor.limit_data_size()
+    df = preprocessor.label_encoding()
+    df = preprocessor.remove_zero_variance()
+    df = preprocessor.feature_correlation(keep_num=250)
+    df = preprocessor.variable_clustering()
+    df = preprocessor.normalize()
+
+    # Define your data and target variable
+    X = df.drop(columns=[target])
+    y = df[target]
+
+    model = FeatureSelector(X, y)
+    final_vars = model.process()
+
+    # Denormalize the data and select final features
+    df = preprocessor.denormalize(df)
+    X = df[final_vars]
+
+    # Create an instance of the Model class and train it
+    model_rf = Model('random_forest', X, y)
+    model_rf.train()
+
+    # Extract top features to pdf
+    model_rf.export_to_pdf('random_forest_plots.pdf')
 
 
-
-path = 'data/'
-df = pd.read_csv(path + 'data.csv')
-
-# Initialize your preprocessing class
-target = 'TARGET'
-preprocessor = DataPreprocessing(df, target)
-
-# Apply preprocessing steps
-df = preprocessor.clean()
-df = preprocessor.remove_high_nullity(threshold=0.8)
-df = preprocessor.remove_zero_variance()
-df = preprocessor.balance_classes(threshold=0.95)
-df = preprocessor.limit_data_size()
-df = preprocessor.label_encoding()
-df = preprocessor.feature_correlation(keep_num=250)
-df = preprocessor.variable_clustering()
-df = preprocessor.normalize()
-
-# Define your data and target variable
-X = df.drop(columns=[target])
-y = df[target]
-
-model = FeatureSelector(X, y)
-final_vars = model.process()
-
-# Denormalize the data and select final features
-df = preprocessor.denormalize(df)
-X = df[final_vars]
-
-# Create an instance of the Model class and train it
-model_rf = Model('random_forest', X, y)
-model_rf.train()
-
-# Show top 10 features for the random forest model
-print(model_rf.feature_importance(top_n=10))
-model_rf.plot_features(n_bins=10)
-model_rf.export_to_pdf('random_forest_plots.pdf')
