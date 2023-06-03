@@ -2,19 +2,29 @@
 import os
 import pandas as pd
 import numpy as np
+import seaborn as sns
 import matplotlib.pyplot as plt
 
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-
-
-path = 'data/'
-
-# Load data
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.model_selection import train_test_split
 
 from sklearn.utils import resample
 from scipy.stats import pointbiserialr, chi2_contingency
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import pdist, squareform
+
+import matplotlib.backends.backend_pdf
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_selection import RFE
+from sklearn.linear_model import LogisticRegression
+import xgboost as xgb
+from sklearn.inspection import permutation_importance
+import numpy as np
+import pandas as pd
+from scipy.stats import spearmanr
+from collections import defaultdict
 
 class DataPreprocessing:
     def __init__(self, df, target):
@@ -53,7 +63,7 @@ class DataPreprocessing:
         return self.df
 
     def clean(self):
-        self.df.columns = map(str.upper, self.df.columns)
+        self.df.columns = self.df.columns.str.upper()  # Vectorized string operation
         self.df = self.df.loc[:, ~self.df.columns.str.endswith(('_ID', '_NBR'))].copy()
         self.df.fillna(0, inplace=True)
         return self.df
@@ -113,13 +123,14 @@ class DataPreprocessing:
             chi2_vals[col] = chi2_contingency(contingency_table)[0]
         return chi2_vals
 
-    def feature_correlation(self):
+    def feature_correlation(self, keep_num):
         correlations_num = self.calc_pointbiserialr()
         correlations_cat = self.calc_chi2_contingency()
         # Merge the two dictionaries
         correlations = {**correlations_num, **correlations_cat}
-        # Keep only top 250 features
-        sorted_corr = sorted(correlations.items(), key=lambda item: abs(item[1]), reverse=True)[:250]
+
+        # Keep only top X features
+        sorted_corr = sorted(correlations.items(), key=lambda item: abs(item[1]), reverse=True)[:keep_num]
         selected_cols = [x[0] for x in sorted_corr]
         
         # Ensure the target column is included
@@ -158,17 +169,6 @@ class DataPreprocessing:
 
         return self.df
 
-
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.feature_selection import RFE
-from sklearn.linear_model import LogisticRegression
-import xgboost as xgb
-from sklearn.inspection import permutation_importance
-import numpy as np
-import pandas as pd
-from scipy.stats import spearmanr
-from collections import defaultdict
-
 class FeatureSelector:
     def __init__(self, X, y):
         self.X = X
@@ -199,22 +199,26 @@ class FeatureSelector:
 
     def process(self):
 
-        rfe_rf = RFE(estimator=RandomForestClassifier(), n_features_to_select=200, step=1)
+        print('Selecting features using RFE with Random Forest...')
+        rfe_rf = RFE(estimator=RandomForestClassifier(n_jobs=-1, random_state=42, n_estimators=100), n_features_to_select=200, step=1)
         rfe_rf.fit(self.X, self.y)
         rfe_rf_cols = self.X.columns[rfe_rf.support_]
         rfe_rf_importances = rfe_rf.estimator_.feature_importances_
 
-        rfe_lr = RFE(estimator=LogisticRegression(max_iter=5000), n_features_to_select=200, step=1)
+        print('Selecting features using RFE with Logistic Regression...')
+        rfe_lr = RFE(estimator=LogisticRegression(max_iter=5000, n_jobs=-1), n_features_to_select=200, step=1)
         rfe_lr.fit(self.X, self.y)
         rfe_lr_cols = self.X.columns[rfe_lr.support_]
         rfe_lr_importances = np.abs(rfe_lr.estimator_.coef_)[0]
 
-        model = xgb.XGBClassifier()
+        print('Selecting features using XGBoost...')
+        model = xgb.XGBClassifier(n_jobs=-1)
         model.fit(self.X, self.y)
         xgb_cols = self.X.columns
         xgb_importances = model.feature_importances_
 
-        rf = RandomForestClassifier().fit(self.X, self.y)
+        print('Selecting features using permutation importance...')
+        rf = RandomForestClassifier(n_jobs=-1, random_state=42, n_estimators=25).fit(self.X, self.y)
         permutation_result = permutation_importance(rf, self.X, self.y, n_repeats=10, random_state=0)
         permutation_cols = self.X.columns
         permutation_importances = permutation_result.importances_mean
@@ -241,6 +245,7 @@ class FeatureSelector:
             # get top 50 from each method
             top_features.append(sorted_cols[:50])
 
+        print('Getting common features from all methods...')
         # get common features
         common_features = list(set.intersection(*[set(method) for method in top_features]))
 
@@ -260,7 +265,105 @@ class FeatureSelector:
         return common_features
 
 
+class Model:
+    def __init__(self, model_type, X, y):
+        self.model_type = model_type
+        self.X = X
+        self.y = y
+        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(self.X, self.y, test_size=0.2, random_state=42)
 
+    def train(self):
+        print('Assessing final features...')
+        if self.model_type == 'random_forest':
+            self.model = RandomForestClassifier(n_jobs=-1, n_estimators=100, random_state=42)
+        elif self.model_type == 'xgboost':
+            self.model = xgb.XGBClassifier(n_jobs=-1, eval_metric='logloss')
+        else:
+            raise Exception("Invalid model_type; available types: 'random_forest', 'xgboost'")
+        
+        self.model.fit(self.X_train, self.y_train)
+
+    def predict(self):
+        self.y_pred = self.model.predict(self.X_test)
+        return self.y_pred
+
+    def evaluate(self):
+        print(classification_report(self.y_test, self.y_pred))
+        print(confusion_matrix(self.y_test, self.y_pred))
+
+    def feature_importance(self, top_n):
+        if self.model_type in ['random_forest', 'xgboost']:
+            feature_importances = self.model.feature_importances_
+            feature_importances = pd.Series(feature_importances, index=self.X.columns)
+            top_features = feature_importances.sort_values(ascending=False)[:top_n]
+            return top_features
+        else:
+            raise Exception(f"No feature importances available for model type: {self.model_type}")
+
+    def plot_importance(self, top_n=10, pdf_pages=None):
+        importances = self.feature_importance(top_n)
+        
+        fig = plt.figure(figsize=(10, 6))
+        plt.title("Feature Importances")
+        importances.sort_values().plot(kind='barh', colormap='Blues_r')
+        plt.xlabel('Relative Importance')
+        plt.tight_layout()
+
+        # If pdf_pages is not None, save the figure to the pdf
+        if pdf_pages is not None:
+            pdf_pages.savefig(fig)
+        else:
+            plt.show()
+
+    def plot_features(self, n_bins, pdf_pages=None):
+        data = self.X.copy()
+        data['TARGET'] = self.y
+
+        for feature in self.X.columns:
+            fig = plt.figure(figsize=(10, 6))
+            unique_vals = data[feature].nunique()
+            if unique_vals <= n_bins:
+                # Group by each unique value if less than or equal to 10
+                feature_avg_target = data.groupby(feature)['TARGET'].mean().round(2)
+                bars = sns.barplot(x=feature_avg_target.index, y=feature_avg_target.values, palette="Blues_r")
+            else:
+                # If more than 10 unique values, bin into 10 buckets of equal size
+                data[feature + '_bins'] = pd.qcut(data[feature], q=n_bins, duplicates='drop')
+                # Transform bin ranges from interval to string format
+                data[feature + '_bins'] = data[feature + '_bins'].apply(lambda x: f'{x.left} to {x.right}')
+                binned_avg_target = data.groupby(feature + '_bins')['TARGET'].mean().round(2)
+                bars = sns.barplot(x=binned_avg_target.index, y=binned_avg_target.values, palette="Blues_r")
+
+            # Add value labels on top of each bar
+            for rect in bars.patches:
+                height = rect.get_height()
+                plt.text(rect.get_x() + rect.get_width() / 2, height, f'{height}', ha='center', va='bottom')
+
+            plt.title(f'Average TARGET per {feature}')
+            plt.xlabel(feature)
+            plt.ylabel('Average TARGET')
+            plt.xticks(rotation=90)  # Rotate x-axis labels
+            plt.tight_layout()
+            
+            # If pdf_pages is not None, save the figure to the pdf
+            if pdf_pages is not None:
+                pdf_pages.savefig(fig)
+            else:
+                plt.show()
+
+            
+    def export_to_pdf(self, filename, n_bins=10):
+        with matplotlib.backends.backend_pdf.PdfPages(filename) as pdf:
+            # Plot and save feature importance
+            self.plot_importance(n_bins, pdf_pages=pdf)
+            # Plot and save feature charts
+            self.plot_features(n_bins=n_bins, pdf_pages=pdf)
+
+
+
+
+
+path = 'data/'
 df = pd.read_csv(path + 'data.csv')
 
 # Initialize your preprocessing class
@@ -274,9 +377,26 @@ df = preprocessor.remove_zero_variance()
 df = preprocessor.balance_classes(threshold=0.95)
 df = preprocessor.limit_data_size()
 df = preprocessor.label_encoding()
-df = preprocessor.feature_correlation()
+df = preprocessor.feature_correlation(keep_num=250)
 df = preprocessor.variable_clustering()
 df = preprocessor.normalize()
 
-model = FeatureSelector(df.drop(columns=[target]), df[target])
+# Define your data and target variable
+X = df.drop(columns=[target])
+y = df[target]
+
+model = FeatureSelector(X, y)
 final_vars = model.process()
+
+# Denormalize the data and select final features
+df = preprocessor.denormalize(df)
+X = df[final_vars]
+
+# Create an instance of the Model class and train it
+model_rf = Model('random_forest', X, y)
+model_rf.train()
+
+# Show top 10 features for the random forest model
+print(model_rf.feature_importance(top_n=10))
+model_rf.plot_features(n_bins=10)
+model_rf.export_to_pdf('random_forest_plots.pdf')
