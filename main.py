@@ -20,6 +20,9 @@ from scipy.stats import pointbiserialr, chi2_contingency, spearmanr
 from scipy.cluster.hierarchy import linkage, fcluster
 from scipy.spatial.distance import pdist, squareform
 
+import time
+from functools import wraps
+
 import xgboost as xgb
 
 from collections import defaultdict
@@ -32,6 +35,21 @@ import warnings
 from sklearn.exceptions import ConvergenceWarning
 
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
+
+
+def timer_decorator(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start_time = time.time()  # get the current time
+        result = func(*args, **kwargs)  # call the original function
+        end_time = time.time()  # get the current time after it finishes
+        time_taken = (
+            end_time - start_time
+        ) / 60.0  # compute the difference and convert to minutes
+        print(f"The function {func.__name__} took {time_taken:.2f} minute(s) to run.")
+        return result
+
+    return wrapper
 
 
 class DataPreprocessing:
@@ -232,147 +250,70 @@ class FeatureSelector:
         self.X = X
         self.y = y
 
+    @timer_decorator
     def rfe_rf(self):
         selector = RFE(
-            estimator=RandomForestClassifier(), n_features_to_select=200, step=1
-        )
-        selector = selector.fit(self.X, self.y)
-        return self.X.columns[selector.support_]
-
-    def rfe_lr(self):
-        selector = RFE(
-            estimator=LogisticRegression(max_iter=1000),
+            estimator=RandomForestClassifier(n_jobs=-1),
             n_features_to_select=200,
             step=1,
         )
         selector = selector.fit(self.X, self.y)
-        return self.X.columns[selector.support_]
+        return (
+            self.X.columns[selector.support_],
+            selector.estimator_.feature_importances_,
+        )
 
+    @timer_decorator
+    def rfe_lr(self):
+        selector = RFE(
+            estimator=LogisticRegression(max_iter=1000, n_jobs=-1),
+            n_features_to_select=200,
+            step=1,
+        )
+        selector = selector.fit(self.X, self.y)
+        return self.X.columns[selector.support_], np.abs(selector.estimator_.coef_)[0]
+
+    @timer_decorator
     def xgboost(self):
-        model = xgb.XGBClassifier(use_label_encoder=False)
+        model = xgb.XGBClassifier(n_jobs=-1, eval_metric="logloss")
         model.fit(self.X, self.y)
-        importance = model.feature_importances_
-        idx = np.argsort(importance)[-200:]
-        return self.X.columns[idx]
+        return self.X.columns, model.feature_importances_
 
+    @timer_decorator
     def permutation_importance(self):
-        rf = RandomForestClassifier().fit(self.X, self.y)
+        rf = RandomForestClassifier(n_jobs=-1).fit(self.X, self.y)
         result = permutation_importance(
             rf, self.X, self.y, n_repeats=10, random_state=0
         )
-        sorted_idx = result.importances_mean.argsort()[-200:]
-        return self.X.columns[sorted_idx]
+        return self.X.columns, result.importances_mean
 
     def process(self):
         final_vars = []
 
-        def get_top_features(cols, importances):
-            # Sort features by importance
-            sorted_idx = np.argsort(importances)[::-1]
-            sorted_cols = [cols[i] for i in sorted_idx]
-            to_drop = []
-            for i, col in enumerate(sorted_cols):
-                # Compare only with more important features
-                cor_matrix = self.X[sorted_cols[: i + 1]].corr().abs()
-                # If current feature is highly correlated with any preceding feature
-                if any(cor_matrix[col][:-1] > 0.7):
-                    to_drop.append(col)
-            sorted_cols = [col for col in sorted_cols if col not in to_drop]
-            return sorted_cols[:3]  # Return top 3 features
+        methods = [self.rfe_rf, self.rfe_lr, self.xgboost, self.permutation_importance]
 
-        print("Selecting features using RFE with Random Forest...")
-        rfe_rf = RFE(
-            estimator=RandomForestClassifier(
-                n_jobs=-1, random_state=42, n_estimators=100
-            ),
-            n_features_to_select=200,
-            step=1,
-        )
-        rfe_rf.fit(self.X, self.y)
-        rfe_rf_cols = self.X.columns[rfe_rf.support_]
-        rfe_rf_importances = rfe_rf.estimator_.feature_importances_
-        final_vars.extend(get_top_features(rfe_rf_cols.to_list(), rfe_rf_importances))
-
-        print("Selecting features using RFE with Logistic Regression...")
-        rfe_lr = RFE(
-            estimator=LogisticRegression(max_iter=10000, n_jobs=-1),
-            n_features_to_select=100,
-            step=1,
-        )
-        rfe_lr.fit(self.X, self.y)
-        rfe_lr_cols = self.X.columns[rfe_lr.support_]
-        rfe_lr_importances = np.abs(rfe_lr.estimator_.coef_)[0]
-        final_vars.extend(get_top_features(rfe_lr_cols.to_list(), rfe_lr_importances))
-
-        print("Selecting features using XGBoost...")
-        model = xgb.XGBClassifier(n_jobs=-1)
-        model.fit(self.X, self.y)
-        xgb_cols = self.X.columns
-        xgb_importances = model.feature_importances_
-        final_vars.extend(get_top_features(xgb_cols.to_list(), xgb_importances))
-
-        print("Selecting features using permutation importance...")
-        rf = RandomForestClassifier(n_jobs=-1, random_state=42, n_estimators=25).fit(
-            self.X, self.y
-        )
-        permutation_result = permutation_importance(
-            rf, self.X, self.y, n_repeats=10, random_state=0
-        )
-        permutation_cols = self.X.columns
-        permutation_importances = permutation_result.importances_mean
-        final_vars.extend(
-            get_top_features(permutation_cols.to_list(), permutation_importances)
-        )
+        for method in methods:
+            print(f"Selecting features using {method.__name__}...")
+            cols, importances = method()
+            final_vars.extend(self.get_top_features(cols, importances))
 
         final_vars = list(set(final_vars))  # Remove duplicates
 
-        methods = [
-            (rfe_rf_cols.to_list(), rfe_rf_importances),
-            (rfe_lr_cols.to_list(), rfe_lr_importances),
-            (xgb_cols.to_list(), xgb_importances),
-            (permutation_cols.to_list(), permutation_importances),
-        ]
-
-        top_features = []
-        for cols, importances in methods:
-            # Sort features by importance
-            sorted_idx = np.argsort(importances)[::-1]
-            sorted_cols = [cols[i] for i in sorted_idx]
-            to_drop = []
-            for i, col in enumerate(sorted_cols):
-                # Compare only with more important features
-                cor_matrix = self.X[sorted_cols[: i + 1]].corr().abs()
-                # If current feature is highly correlated with any preceding feature
-                if any(cor_matrix[col][:-1] > 0.7):
-                    to_drop.append(col)
-            sorted_cols = [col for col in sorted_cols if col not in to_drop]
-
-            # get top 50 from each method
-            top_features.append(sorted_cols[:50])
-
-        print("Getting common features from all methods...")
-
-        # get common features, add to final_vars
-        common_features = list(
-            set.intersection(*[set(method) for method in top_features])
-        )
-        final_vars.extend(common_features)
-        final_vars = list(set(final_vars))  # Remove duplicates
-
-        # if common features < 50, get from rfe_rf_cols and xgb_cols
-        if len(final_vars) < 50:
-            alternates = list(zip(rfe_rf_cols, xgb_cols))
-            alternates = list(itertools.chain(*alternates))  # Flatten the list
-            for feature in alternates:
-                if feature not in final_vars:
-                    cor_matrix = self.X[final_vars + [feature]].corr().abs()
-                    if all(cor_matrix[feature][:-1] < 0.7):
-                        final_vars.append(feature)
-                        if len(final_vars) == 50:
-                            break
-
-        final_vars = list(set(final_vars))  # Remove duplicates after adding features
         return final_vars
+
+    def get_top_features(self, cols, importances):
+        # Sort features by importance
+        sorted_idx = np.argsort(importances)[::-1]
+        sorted_cols = [cols[i] for i in sorted_idx]
+        to_drop = []
+        for i, col in enumerate(sorted_cols):
+            # Compare only with more important features
+            cor_matrix = self.X[sorted_cols[: i + 1]].corr().abs()
+            # If current feature is highly correlated with any preceding feature
+            if any(cor_matrix[col][:-1] > 0.7):
+                to_drop.append(col)
+        sorted_cols = [col for col in sorted_cols if col not in to_drop]
+        return sorted_cols[:3]  # Return top 3 features
 
 
 class Model:
@@ -530,6 +471,8 @@ def read_and_union_csvs(directory="."):
         # Append the data to the combined dataframe
         combined_df = pd.concat([combined_df, df], ignore_index=True)
 
+    return_stats(combined_df)
+
     return combined_df
 
 
@@ -539,7 +482,7 @@ def return_stats(df):
     conv_rate = tot_conv / tot_len
 
     print(
-        f"Conversion Rate: {round(conv_rate*100,2)} | Total conversions: {tot_conv} | Total instances: {tot_len} | Total features: {len(df.columns)}"
+        f"Conversion Rate: {round(conv_rate,2)} | Total conversions: {tot_conv} | Total instances: {tot_len} | Total features: {len(df.columns)}"
     )
 
 
@@ -588,4 +531,4 @@ if __name__ == "__main__":
 
     # Extract top features to pdf
     model_rf.export_to_pdf("random_forest_plots.pdf")
-    model_rf.export_features_to_csv("random_forest_features.csv")
+    model_rf.export_features_to_csv("selected_features.csv")
