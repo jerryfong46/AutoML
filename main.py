@@ -101,7 +101,11 @@ class DataPreprocessing:
 
     def clean(self):
         self.df.columns = self.df.columns.str.upper()  # Vectorized string operation
-        self.df = self.df.loc[:, ~self.df.columns.str.endswith(("_ID", "_NBR"))].copy()
+        self.df = self.df.loc[
+            :,
+            ~self.df.columns.str.endswith(("_ID", "_NBR"))
+            & ~self.df.columns.str.contains("_ID_"),
+        ].copy()
         self.df.fillna(0, inplace=True)
         return self.df
 
@@ -254,8 +258,8 @@ class FeatureSelector:
     def rfe_rf(self):
         selector = RFE(
             estimator=RandomForestClassifier(n_jobs=-1),
-            n_features_to_select=200,
-            step=1,
+            n_features_to_select=50,
+            step=3,
         )
         selector = selector.fit(self.X, self.y)
         return (
@@ -267,8 +271,8 @@ class FeatureSelector:
     def rfe_lr(self):
         selector = RFE(
             estimator=LogisticRegression(max_iter=1000, n_jobs=-1),
-            n_features_to_select=200,
-            step=1,
+            n_features_to_select=50,
+            step=3,
         )
         selector = selector.fit(self.X, self.y)
         return self.X.columns[selector.support_], np.abs(selector.estimator_.coef_)[0]
@@ -277,27 +281,62 @@ class FeatureSelector:
     def xgboost(self):
         model = xgb.XGBClassifier(n_jobs=-1, eval_metric="logloss")
         model.fit(self.X, self.y)
-        return self.X.columns, model.feature_importances_
+        importances = model.feature_importances_
+        # get indices of top 50 features
+        top_indices = np.argsort(importances)[::-1][:50]
+        top_features = self.X.columns[top_indices]
+        return top_features, importances[top_indices]
 
     @timer_decorator
     def permutation_importance(self):
-        rf = RandomForestClassifier(n_jobs=-1).fit(self.X, self.y)
-        result = permutation_importance(
-            rf, self.X, self.y, n_repeats=10, random_state=0
-        )
-        return self.X.columns, result.importances_mean
+        rf = RandomForestClassifier(n_jobs=-1, n_estimators=25).fit(self.X, self.y)
+        result = permutation_importance(rf, self.X, self.y, n_repeats=2, random_state=0)
+        importances = result.importances_mean
+        # get indices of top 50 features
+        top_indices = np.argsort(importances)[::-1][:50]
+        top_features = self.X.columns[top_indices]
+        return top_features, importances[top_indices]
 
     def process(self):
         final_vars = []
+        top_features = []
 
         methods = [self.rfe_rf, self.rfe_lr, self.xgboost, self.permutation_importance]
 
         for method in methods:
             print(f"Selecting features using {method.__name__}...")
             cols, importances = method()
-            final_vars.extend(self.get_top_features(cols, importances))
+            top_features.extend(self.get_top_features(cols, importances))
+        
+        print(top_features)
 
+        # Get common features, add to final_vars
+        common_features = list(
+            set.intersection(*[set(method) for method in top_features])
+        )
+        print(common_features)
+
+        final_vars.extend(common_features)
         final_vars = list(set(final_vars))  # Remove duplicates
+
+        print(final_vars)
+
+        # If common features < 50, get from rfe_rf_cols and xgboost_cols
+        if len(final_vars) < 50:
+            rfe_rf_cols, _ = self.rfe_rf()
+            xgb_cols, _ = self.xgboost()
+            alternates = list(zip(rfe_rf_cols, xgb_cols))
+            alternates = list(itertools.chain(*alternates))  # Flatten the list
+            for feature in alternates:
+                if feature not in final_vars:
+                    cor_matrix = self.X[final_vars + [feature]].corr().abs()
+                    if all(cor_matrix[feature][:-1] < 0.7):
+                        final_vars.append(feature)
+                        if len(final_vars) >= 50:
+                            break
+            final_vars = list(
+                set(final_vars)
+            )  # Remove duplicates after adding features
 
         return final_vars
 
